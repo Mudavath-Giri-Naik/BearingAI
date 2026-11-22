@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: bearingai-api
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./backend/Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: BEARING_AUTH_MODE
+        value: supabase
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_DATASETS_BUCKET
+        value: bearing-datasets
+      - key: SUPABASE_MODELS_BUCKET
+        value: bearing-model-artifacts
+
+  - type: worker
+    name: bearingai-training-worker
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./backend/Dockerfile
+    plan: starter
+    dockerCommand: python -m app.worker
+    envVars:
+      - key: BEARING_AUTH_MODE
+        value: supabase
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: SUPABASE_DATASETS_BUCKET
+        value: bearing-datasets
+      - key: SUPABASE_MODELS_BUCKET
+        value: bearing-model-artifacts

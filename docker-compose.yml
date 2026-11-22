@@ -1,0 +1,46 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      BEARING_ADMIN_KEY: ${BEARING_ADMIN_KEY:?Set BEARING_ADMIN_KEY in .env}
+      BEARING_STORAGE: /storage
+    volumes:
+      - ./storage:/storage
+    ports:
+      - '127.0.0.1:9000:9000'
+    restart: unless-stopped
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: python -m app.worker
+    environment:
+      BEARING_STORAGE: /storage
+    volumes:
+      - ./storage:/storage
+    restart: unless-stopped
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+        NEXT_PUBLIC_BEARING_AUTH_MODE: ${NEXT_PUBLIC_BEARING_AUTH_MODE:-local}
+    environment:
+      API_INTERNAL_URL: http://api:9000
+      BEARING_ADMIN_KEY: ${BEARING_ADMIN_KEY:?Set BEARING_ADMIN_KEY in .env}
+      STUDIO_PASSWORD: ${STUDIO_PASSWORD:?Set STUDIO_PASSWORD in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY:-}
+      NEXT_PUBLIC_BEARING_AUTH_MODE: ${NEXT_PUBLIC_BEARING_AUTH_MODE:-local}
+    ports:
+      - '3000:3000'
+    depends_on:
+      - api
+    restart: unless-stopped
