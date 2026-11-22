@@ -26,6 +26,19 @@ For direct processes:
 
 The schema defines all requested logical entities, role-aware policies, immutable dataset file records, artifact checksums, and private buckets. The API/worker have not yet been switched to this schema or Storage; a successful SQL migration alone does not make the application production-ready.
 
+## Approved inference model registry
+
+The currently supported inference API still uses SQLite under `BEARING_STORAGE` and reads model files from `BEARING_STORAGE/models`. Startup registration is idempotent: it inserts only the three reviewed catalog records whose artifact passes its pinned SHA-256 and deserialization checks. `/api/v1/models` exposes only those records with `active` or `available` status and a valid local artifact. The private-object sync downloads missing or invalid files from Supabase Storage to a temporary file, verifies the pinned checksum, and atomically replaces the local copy. It never writes a database row for a missing or unverified artifact.
+
+Before deploying this catalog change:
+
+1. In the private `bearing-model-artifacts` bucket, upload the original files under `approved/` without changing their bytes: `nbc_cnn.pt` (`7bf937b0d39dc1fb6b111dab922efba92bcf94170e8144db6a1f412dfc388a04`), `nbc_core_v3.joblib` (`b98b8cb83f9d75f565c99affcdf1dcac4904e60f3e7850a92fe9243d553b0f53`), and `timken_core_v3.joblib` (`cca407eaf60ad87df00c7be1d4d2b9ab389d12aecd33279285aff65ee3e42f4a`). These hashes identify the verified repository copies; the app rejects objects whose checksum differs.
+2. On the Render API only, configure `BEARING_AUTH_MODE=local` and a strong `BEARING_ADMIN_KEY` secret (also set the matching key as a server-only Vercel environment variable for the existing proxy), plus `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_MODELS_BUCKET=bearing-model-artifacts`, and `SUPABASE_MODELS_PREFIX=approved`. Keep both keys in their respective secret environment settings. Do not put the service-role key in Vercel, source control, or any `NEXT_PUBLIC_*` variable.
+3. Keep `BEARING_STORAGE=/storage` and attach the Render API disk at `/storage` as shown in `render.yaml`. This preserves the SQLite registry and verified artifact cache across restarts. The current separate worker does not share that disk; do not use it for registry or training state until the PostgreSQL/Storage worker adapter is implemented.
+4. After an explicitly approved API deployment/restart, confirm `/health`, then `/api/v1/models` lists NBC Pulse Vision 1, NBC Pulse Core 3, and TIMKEN Pulse Core 3. Startup will create missing SQLite model rows only after artifact verification. No production database or storage mutation is performed by local tests.
+
+The backend's Supabase/PostgreSQL registry adapter is still not implemented. The model-list and prediction service continue to use the persistent Render SQLite disk; do not set `BEARING_AUTH_MODE=supabase` with this code unless the startup guard and remaining persistence migration have been separately completed. Studio calls in the current local-auth mode still use the existing shared server-side admin-key mechanism; migrate that identity path before removing its documented prototype status.
+
 ## Vercel frontend instructions (OAuth flow is implemented; API runtime is still pending)
 
 1. Import the monorepo into Vercel and set the project root to `frontend/`.

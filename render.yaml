@@ -6,9 +6,17 @@ services:
     dockerfilePath: ./backend/Dockerfile
     plan: starter
     healthCheckPath: /health
+    disk:
+      name: bearingai-api-storage
+      mountPath: /storage
+      sizeGB: 1
     envVars:
       - key: BEARING_AUTH_MODE
-        value: supabase
+        value: local
+      - key: BEARING_STORAGE
+        value: /storage
+      - key: BEARING_ADMIN_KEY
+        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_ANON_KEY
@@ -21,6 +29,8 @@ services:
         value: bearing-datasets
       - key: SUPABASE_MODELS_BUCKET
         value: bearing-model-artifacts
+      - key: SUPABASE_MODELS_PREFIX
+        value: approved
 
   - type: worker
     name: bearingai-training-worker

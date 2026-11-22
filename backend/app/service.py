@@ -1,5 +1,5 @@
 """BearingAI API: experimental classification, versioned artifacts and guarded studio operations."""
-import os, json, sqlite3, io, hashlib, zipfile, uuid, time, threading, re, urllib.request, urllib.error
+import os, json, sqlite3, io, hashlib, zipfile, uuid, time, threading, re, urllib.request, urllib.error, urllib.parse
 from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -17,6 +17,14 @@ ROOT.mkdir(parents=True,exist_ok=True)
 DB=ROOT/'registry.sqlite3'; ADMIN_KEY=os.environ.get('BEARING_ADMIN_KEY','')
 THRESHOLD=0.8
 AUTH_MODE=os.environ.get('BEARING_AUTH_MODE','local').lower()
+# Only these reviewed model versions are eligible for public listing. Checksums
+# bind registration and private-storage downloads to the preserved binaries.
+PUBLIC_MODELS={
+ 'nbc-vision-1':('NBC','Pulse Vision 1','cnn','1.0.0','nbc_cnn.pt','7bf937b0d39dc1fb6b111dab922efba92bcf94170e8144db6a1f412dfc388a04','active',{'accuracy':.9,'bad_recall':.96,'good_specificity':.6,'test_n':30},'spectral_cnn'),
+ 'nbc-core-3':('NBC','Pulse Core 3','feature','3.0.0','nbc_core_v3.joblib','b98b8cb83f9d75f565c99affcdf1dcac4904e60f3e7850a92fe9243d553b0f53','available',{'accuracy':.8667,'bad_recall':.96,'good_specificity':.4,'test_n':30},'rbf_svm'),
+ 'timken-core-3':('TIMKEN','Pulse Core 3','feature','3.0.0','timken_core_v3.joblib','cca407eaf60ad87df00c7be1d4d2b9ab389d12aecd33279285aff65ee3e42f4a','active',{'accuracy':.825,'bad_recall':.84375,'good_specificity':.75,'test_n':40},'catboost'),
+}
+_VALID_ARTIFACTS={}
 class SpectralCNN(nn.Module):
  def __init__(self):
   super().__init__(); self.conv=nn.Sequential(nn.Conv1d(2,16,9,padding=4),nn.BatchNorm1d(16),nn.GELU(),nn.MaxPool1d(2),nn.Conv1d(16,32,7,padding=3),nn.BatchNorm1d(32),nn.GELU(),nn.MaxPool1d(2),nn.Conv1d(32,48,5,padding=2),nn.BatchNorm1d(48),nn.GELU(),nn.AdaptiveAvgPool1d(12))
@@ -30,6 +38,67 @@ def db():
  try:
   yield c;c.commit()
  finally:c.close()
+
+def _artifact_digest(path):
+ h=hashlib.sha256()
+ with path.open('rb') as f:
+  for chunk in iter(lambda:f.read(1024*1024),b''):h.update(chunk)
+ return h.hexdigest()
+
+def _valid_artifact(model_id):
+ spec=PUBLIC_MODELS.get(model_id)
+ if not spec:return False
+ company,_,kind,version,filename,digest,_,_,expected_algorithm=spec
+ path=(ROOT/'models'/filename).resolve()
+ if path.parent!=(ROOT/'models').resolve() or not path.is_file():return False
+ try:
+  actual=_artifact_digest(path)
+  if actual!=digest:return False
+  cache_key=(model_id,actual)
+  if cache_key in _VALID_ARTIFACTS:return _VALID_ARTIFACTS[cache_key]
+  if kind=='cnn':
+   checkpoint=torch.load(path,map_location='cpu',weights_only=True)
+   model=SpectralCNN();model.load_state_dict(checkpoint['state_dict'],strict=True)
+   valid=checkpoint.get('architecture')=='SpectralCNN'
+  else:
+   entry=joblib.load(path)
+   valid=(entry.get('brand')==company and entry.get('algorithm')==expected_algorithm
+          and entry.get('version')==f"v{version.split('.')[0]}"
+          and isinstance(entry.get('features'),list) and len(entry['features'])>0
+          and len(entry['features'])==len(set(entry['features']))
+          and hasattr(entry.get('model'),'predict_proba'))
+  _VALID_ARTIFACTS[cache_key]=bool(valid)
+  return bool(valid)
+ except Exception as e:
+  print(f'Model artifact validation failed for {model_id}: {type(e).__name__}')
+  return False
+
+def sync_private_model_artifacts():
+ """Fetch only checksum-approved artifacts from the private Supabase bucket."""
+ base=os.environ.get('SUPABASE_URL','').rstrip('/')
+ key=os.environ.get('SUPABASE_SERVICE_ROLE_KEY','')
+ bucket=os.environ.get('SUPABASE_MODELS_BUCKET','bearing-model-artifacts')
+ if not base or not key:return
+ for model_id,spec in PUBLIC_MODELS.items():
+  filename,digest=spec[4],spec[5]
+  target=ROOT/'models'/filename
+  if _valid_artifact(model_id):continue
+  object_path='/'.join(filter(None,(os.environ.get('SUPABASE_MODELS_PREFIX','approved').strip('/'),filename)))
+  url=f"{base}/storage/v1/object/authenticated/{urllib.parse.quote(bucket,safe='')}/{urllib.parse.quote(object_path,safe='/')}"
+  temp=target.with_name(target.name+'.download')
+  try:
+   request=urllib.request.Request(url,headers={'apikey':key,'authorization':f'Bearer {key}'})
+   with urllib.request.urlopen(request,timeout=30) as response:
+    data=response.read(536870913)
+   if len(data)>536870912 or hashlib.sha256(data).hexdigest()!=digest:
+    print(f'Private model artifact rejected: {model_id} checksum/size mismatch')
+    continue
+   temp.write_bytes(data);os.replace(temp,target);_VALID_ARTIFACTS.pop((model_id,digest),None)
+  except Exception as e:
+   print(f'Private model artifact unavailable for {model_id}: {type(e).__name__}')
+  finally:
+   if temp.exists():temp.unlink()
+
 def init_db():
  with db() as c:
   c.executescript('''CREATE TABLE IF NOT EXISTS models(id TEXT PRIMARY KEY,company TEXT NOT NULL,name TEXT NOT NULL,kind TEXT NOT NULL,version TEXT NOT NULL,path TEXT NOT NULL,status TEXT NOT NULL,metrics TEXT NOT NULL,created_at TEXT NOT NULL,training_dataset TEXT);
@@ -37,10 +106,10 @@ def init_db():
   CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,company TEXT NOT NULL,family TEXT NOT NULL,dataset_id TEXT NOT NULL,status TEXT NOT NULL,logs TEXT NOT NULL,candidate_model TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,event TEXT NOT NULL,detail TEXT NOT NULL,created_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS predictions(id TEXT PRIMARY KEY,company TEXT NOT NULL,model_id TEXT NOT NULL,label TEXT NOT NULL,score REAL NOT NULL,created_at TEXT NOT NULL);''')
-  seeds=[('nbc-vision-1','NBC','Pulse Vision 1','cnn','1.0.0','nbc_cnn.pt',{'accuracy':.9,'bad_recall':.96,'good_specificity':.6,'test_n':30},'active'),('nbc-core-3','NBC','Pulse Core 3','feature','3.0.0','nbc_core_v3.joblib',{'accuracy':.8667,'bad_recall':.96,'good_specificity':.4,'test_n':30},'available'),('timken-core-3','TIMKEN','Pulse Core 3','feature','3.0.0','timken_core_v3.joblib',{'accuracy':.825,'bad_recall':.84375,'good_specificity':.75,'test_n':40},'active'),('nbc-legacy-1','NBC','Pulse Legacy 1','feature','1.0.0','nbc_legacy_v1.joblib',{'accuracy':.7333,'bad_recall':.72,'good_specificity':.8,'test_n':30},'available'),('timken-legacy-1','TIMKEN','Pulse Legacy 1','feature','1.0.0','timken_legacy_v1.joblib',{'accuracy':.625,'bad_recall':.5625,'good_specificity':.875,'test_n':40},'available')]
-  for id,company,name,kind,version,path,metrics,status in seeds:
-   if (ROOT/'models'/path).exists():c.execute('INSERT OR IGNORE INTO models VALUES(?,?,?,?,?,?,?,?,?,?)',(id,company,name,kind,version,path,status,json.dumps(metrics),utc(),'seed-dev'))
-  c.execute("UPDATE models SET status='available' WHERE company='NBC' AND id='nbc-core-3' AND status='active' AND EXISTS (SELECT 1 FROM models WHERE id='nbc-vision-1' AND status='active')")
+  for id,spec in PUBLIC_MODELS.items():
+   company,name,kind,version,path,_,status,metrics,_=spec
+   if _valid_artifact(id):
+    c.execute('INSERT OR IGNORE INTO models VALUES(?,?,?,?,?,?,?,?,?,?)',(id,company,name,kind,version,path,status,json.dumps(metrics),utc(),'approved-seed-v1'))
 def admin(x_admin_key:str|None=Header(default=None),authorization:str|None=Header(default=None)):
  if AUTH_MODE=='supabase':
   base=os.environ.get('SUPABASE_URL','').rstrip('/');anon=os.environ.get('SUPABASE_ANON_KEY','')
@@ -69,14 +138,15 @@ app.add_middleware(CORSMiddleware,allow_origins=[],allow_credentials=False,allow
 def start():
  if AUTH_MODE!='local':
   raise RuntimeError('Supabase production runtime is not yet connected; refusing to start with an unsupported auth mode')
+ sync_private_model_artifacts()
  init_db()
 @app.get('/health')
 def health():return {'status':'ok','database':DB.exists(),'disclaimer':'Research-only predictions'}
 @app.get('/api/v1/models')
 def models(company:str|None=None):
  with db() as c:
-  rows=c.execute("SELECT * FROM models WHERE status IN ('active','available') ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,name",()).fetchall()
- return [row_model(r) for r in rows if not company or r['company']==company.upper()]
+  rows=c.execute("SELECT * FROM models WHERE id IN ('nbc-vision-1','nbc-core-3','timken-core-3') AND status IN ('active','available') ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END,name",()).fetchall()
+ return [row_model(r) for r in rows if (not company or r['company']==company.upper()) and _valid_artifact(r['id'])]
 @app.get('/api/v1/studio/models',dependencies=[Depends(admin)])
 def studio_models():
  with db() as c:return [row_model(r) for r in c.execute('SELECT * FROM models ORDER BY created_at DESC').fetchall()]
@@ -110,8 +180,9 @@ async def predict(company:str=Form(...),model:str|None=Form(None),file:UploadFil
  raw=await file.read(2_000_001)
  if len(raw)>2_000_000:raise HTTPException(413,'CSV exceeds 2 MB')
  with db() as c:
-  r=c.execute('SELECT * FROM models WHERE id=? AND company=? AND status IN (\'active\',\'available\')',(model,company)).fetchone() if model else c.execute('SELECT * FROM models WHERE company=? AND status=\'active\'',(company,)).fetchone()
+  r=c.execute("SELECT * FROM models WHERE id=? AND company=? AND status IN ('active','available') AND id IN ('nbc-vision-1','nbc-core-3','timken-core-3')",(model,company)).fetchone() if model else c.execute("SELECT * FROM models WHERE company=? AND status='active' AND id IN ('nbc-vision-1','nbc-core-3','timken-core-3')",(company,)).fetchone()
  if r is None:raise HTTPException(404,'No selectable model for this company')
+ if not _valid_artifact(r['id']):raise HTTPException(503,'Model artifact unavailable or invalid')
  try:score,ev=load_predict(r,raw)
  except (InvalidSignal,ValueError) as e:raise HTTPException(422,str(e)) from e
  label='BAD' if score>=THRESHOLD else 'GOOD';pid=uuid.uuid4().hex
